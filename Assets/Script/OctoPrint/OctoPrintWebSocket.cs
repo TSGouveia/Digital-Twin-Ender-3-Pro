@@ -7,104 +7,145 @@ using Newtonsoft.Json.Linq;
 public class OctoPrintWebSocket : MonoBehaviour
 {
     private WebSocket websocket;
-    private string octoprintSocketURL = "ws://octopi.local/sockjs/websocket";
     private NozzleController nozzleController;
+
+    // Store auth details for re-authentication
+    private string username;
+    private string sessionKey;
+
+    // Compile Regex once for performance
+    private static readonly Regex PositionRegex = new Regex(@"X:(?<x>[-+]?[0-9]*\.?[0-9]+) Y:(?<y>[-+]?[0-9]*\.?[0-9]+) Z:(?<z>[-+]?[0-9]*\.?[0-9]+)");
 
     private void Start()
     {
         nozzleController = FindAnyObjectByType<NozzleController>();
+        if (nozzleController == null)
+        {
+            Debug.LogError("NozzleController component not found in the scene!");
+        }
     }
-    public async void StartWebSocket(string sessionKey)
+
+    public async void StartWebSocket(string user, string session, string octoPrintAddress)
     {
-        websocket = new WebSocket(octoprintSocketURL);
+        if (websocket != null && websocket.State != WebSocketState.Closed)
+        {
+            Debug.LogWarning("WebSocket is already connecting or connected.");
+            return;
+        }
+
+        // Store credentials for potential re-authentication
+        this.username = user;
+        this.sessionKey = session;
+
+        // Construct WebSocket URL from base address
+        string wsAddress = octoPrintAddress.Replace("http://", "ws://").Replace("https://", "wss://");
+        string socketURL = $"{wsAddress}/sockjs/websocket";
+
+        websocket = new WebSocket(socketURL);
 
         websocket.OnOpen += () =>
         {
-            Debug.Log("Socket Open...");
-            websocket.SendText("{\"auth\": \"rics:" + sessionKey + "\"}");
+            Debug.Log("WebSocket connection opened. Authenticating...");
+            SendAuthMessage();
         };
 
         websocket.OnMessage += (bytes) =>
         {
             string message = System.Text.Encoding.UTF8.GetString(bytes);
+            // OctoPrint often sends an 'o' frame on open, ignore it
+            if (message == "o") return;
             HandleMessage(message);
+        };
+
+        websocket.OnError += (e) =>
+        {
+            Debug.LogError("WebSocket Error: " + e);
+        };
+
+        websocket.OnClose += (e) =>
+        {
+            Debug.Log("WebSocket Connection closed.");
         };
 
         await websocket.Connect();
     }
 
-    void Update()
+    private void Update()
     {
-        if (websocket != null)
-        {
-            websocket.DispatchMessageQueue();
-        }
+        // Required by NativeWebSocket to dispatch messages on the main thread
+        websocket?.DispatchMessageQueue();
     }
 
     private async void OnApplicationQuit()
     {
-        await websocket.Close();
+        if (websocket != null && websocket.State == WebSocketState.Open)
+        {
+            await websocket.Close();
+        }
+    }
+
+    private void SendAuthMessage()
+    {
+        // Use the stored session key for authentication
+        string authPayload = $"{{\"auth\": \"{this.username}:{this.sessionKey}\"}}";
+        websocket.SendText(authPayload);
     }
 
     private void HandleMessage(string message)
     {
+        // The actual payload is often inside a JSON array with a single element
+        if (message.StartsWith("a["))
+        {
+            message = message.Substring(2, message.Length - 4); // Strip "a[\"" and "\"]"
+            message = message.Replace("\\\"", "\""); // Un-escape quotes
+        }
+
         try
         {
             var payload = JObject.Parse(message);
 
-            if (payload["connected"] != null)
-            {
-                Debug.Log("Connected to WebSockets");
-                return;
-            }
-
             if (payload["reauthRequired"] != null)
             {
-                Debug.Log("Re-authentication required: " + payload["reauthRequired"]["reason"]);
-                websocket.SendText("{\"auth\": \"rics:ricsricsjabjab\"}");
+                Debug.LogWarning("Re-authentication required. Re-sending auth message.");
+                SendAuthMessage(); // CRITICAL FIX: Use the correct auth method
                 return;
             }
 
-            if (payload["current"] != null)
+            if (payload["current"]?["logs"] is JArray logs)
             {
-                var current = payload["current"];
-                var logs = current["logs"];
-
-                if (logs != null)
+                foreach (var log in logs)
                 {
-                    foreach (var log in logs)
-                    {
-                        Debug.Log("Terminal Message: " + log.ToString());
-                        ProcessTerminalMessage(log.ToString());
-                    }
+                    ProcessTerminalMessage(log.ToString());
                 }
             }
         }
         catch (Exception ex)
         {
-            Debug.LogError("Failed to parse message: " + ex.Message);
+            // Don't log errors for non-JSON messages like 'h' (heartbeat)
+            if (message != "h")
+            {
+                Debug.LogWarning($"Could not parse WebSocket message as JSON. Message: {message} | Error: {ex.Message}");
+            }
         }
     }
 
     private void ProcessTerminalMessage(string message)
     {
-        // Regex to match the X, Y, and Z values in the terminal message
-        Regex regex = new Regex(@"X:(?<x>[-+]?[0-9]*\.?[0-9]+) Y:(?<y>[-+]?[0-9]*\.?[0-9]+) Z:(?<z>[-+]?[0-9]*\.?[0-9]+)");
-        Match match = regex.Match(message);
+        // Example message: "Recv: ok P15 B3.9 X:10.00 Y:20.00 Z:5.00 E:0.00 Count X:800 Y:1600 Z:2000"
+        Match match = PositionRegex.Match(message);
 
         if (match.Success)
         {
-            float x = float.Parse(match.Groups["x"].Value);
-            float y = float.Parse(match.Groups["y"].Value);
-            float z = float.Parse(match.Groups["z"].Value);
+            // Use InvariantCulture to ensure '.' is used as the decimal separator
+            float x = float.Parse(match.Groups["x"].Value, System.Globalization.CultureInfo.InvariantCulture);
+            float y = float.Parse(match.Groups["y"].Value, System.Globalization.CultureInfo.InvariantCulture);
+            float z = float.Parse(match.Groups["z"].Value, System.Globalization.CultureInfo.InvariantCulture);
 
-            // Call the function with the extracted values
+            // Map printer coordinates (Z-up) to Unity coordinates (Y-up)
+            // Printer X -> Unity X
+            // Printer Y -> Unity Z
+            // Printer Z -> Unity Y
             nozzleController.SetNozzlePosition(new Vector3(x, z, y));
         }
-    }
-
-    public bool IsConnected()
-    {
-        return websocket != null && websocket.State == WebSocketState.Open;
     }
 }
