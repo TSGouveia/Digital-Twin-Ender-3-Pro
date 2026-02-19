@@ -2,33 +2,36 @@ using UnityEngine;
 using System.Collections;
 using UnityEngine.Networking;
 using Newtonsoft.Json.Linq;
+using System.Text;
 
 public class OctoPrintAPI : MonoBehaviour
 {
     [Header("OctoPrint Connection Settings")]
-    [SerializeField] private string octoPrintAddress = "http://octopi.local";
-    [SerializeField] private string apiKey = "SEU_API_KEY_AQUI"; // Coloque sua chave no Inspector
-    [SerializeField] private string username = "USER";
-    [SerializeField] private string password = "PASSWORD";
-    [SerializeField] private bool rememberMe = true;
+    [SerializeField] private string octoPrintAddress = "http://octopi.local"; // IP do script Python
+    [SerializeField] private string apiKey = "API-KEY-HERE";
 
     [Header("Polling Settings")]
-    [Tooltip("Quantas vezes por segundo pedir a posição da impressora.")]
-    [SerializeField] private float pollingRatePerSecond = 5.0f; // 5 vezes por segundo é um bom começo
+    [Tooltip("Intervalo em segundos entre pedidos M114 (evite valores menores que 1.0 para nï¿½o travar o buffer)")]
+    [SerializeField] private float pollingInterval = 2.0f;
 
-    private string sessionKey;
     private OctoPrintWebSocket octoPrintWebSocket;
     private bool isPolling = false;
 
+    // Endereï¿½o correto para comandos de impressora no OctoPrint
     private string ApiCommandUrl => $"{octoPrintAddress}/api/printer/command";
     private string LoginUrl => $"{octoPrintAddress}/api/login";
 
     void Start()
     {
-        octoPrintWebSocket = FindAnyObjectByType<OctoPrintWebSocket>();
+        octoPrintWebSocket = GetComponent<OctoPrintWebSocket>();
         if (octoPrintWebSocket == null)
         {
-            Debug.LogError("Componente OctoPrintWebSocket não encontrado na cena!");
+            octoPrintWebSocket = FindFirstObjectByType<OctoPrintWebSocket>();
+        }
+
+        if (octoPrintWebSocket == null)
+        {
+            Debug.LogError("Componente OctoPrintWebSocket nï¿½o encontrado!");
             return;
         }
 
@@ -37,17 +40,17 @@ public class OctoPrintAPI : MonoBehaviour
 
     private void OnApplicationQuit()
     {
-        // Para o loop de polling quando a aplicação fechar
         isPolling = false;
     }
 
     IEnumerator LoginAndInitialize()
     {
-        string jsonPayload = $"{{\"user\": \"{username}\", \"pass\": \"{password}\", \"remember\": {rememberMe.ToString().ToLower()}}}";
+        // O payload de login passivo ï¿½ o que o script Python usa para pegar a sessï¿½o
+        string jsonPayload = "{\"passive\": true}";
 
         using (UnityWebRequest request = new UnityWebRequest(LoginUrl, "POST"))
         {
-            byte[] bodyRaw = System.Text.Encoding.UTF8.GetBytes(jsonPayload);
+            byte[] bodyRaw = Encoding.UTF8.GetBytes(jsonPayload);
             request.uploadHandler = new UploadHandlerRaw(bodyRaw);
             request.downloadHandler = new DownloadHandlerBuffer();
             request.SetRequestHeader("Content-Type", "application/json");
@@ -57,55 +60,48 @@ public class OctoPrintAPI : MonoBehaviour
 
             if (request.result == UnityWebRequest.Result.Success)
             {
-                Debug.Log("Login bem-sucedido! Resposta: " + request.downloadHandler.text);
-
                 var responseJson = JObject.Parse(request.downloadHandler.text);
-                sessionKey = responseJson["session"]?.ToString();
+                string sessionKey = responseJson["session"]?.ToString();
+                string userName = responseJson["name"]?.ToString();
 
                 if (string.IsNullOrEmpty(sessionKey))
                 {
-                    Debug.LogError("Login bem-sucedido, mas nenhuma chave de sessão foi recebida!");
+                    Debug.LogError("Sessï¿½o nï¿½o encontrada na resposta do login.");
                     yield break;
                 }
 
-                octoPrintWebSocket.StartWebSocket(username, sessionKey, octoPrintAddress);
+                // Inicia o WebSocket passando os dados de autenticaï¿½ï¿½o
+                octoPrintWebSocket.StartWebSocket(userName, sessionKey, octoPrintAddress);
 
-                // Inicia o polling da posição
+                // Inicia o loop de requisiï¿½ï¿½o de coordenadas
                 isPolling = true;
                 StartCoroutine(PollPositionCoroutine());
             }
             else
             {
-                Debug.LogError($"Falha no login com código: {request.responseCode}. Erro: {request.error}");
-                Debug.LogError("Corpo da Resposta: " + request.downloadHandler.text);
+                Debug.LogError($"Erro no Login: {request.responseCode} - {request.error}");
             }
         }
     }
 
-    /// <summary>
-    /// Corrotina que envia o comando M114 em um loop para obter a posição da impressora.
-    /// </summary>
     IEnumerator PollPositionCoroutine()
     {
-        Debug.Log("Iniciando polling de posição com M114...");
         while (isPolling)
         {
-            // Envia o comando para obter a posição atual
+            // O comando M114 faz a impressora devolver "X:0.00 Y:0.00..." no log do WebSocket
             yield return StartCoroutine(SendCommandCoroutine("M114"));
-
-            // Espera pelo intervalo definido antes de enviar o próximo pedido
-            yield return new WaitForSeconds(1.0f / pollingRatePerSecond);
+            yield return new WaitForSeconds(pollingInterval);
         }
-        Debug.Log("Polling de posição interrompido.");
     }
 
     private IEnumerator SendCommandCoroutine(string command)
     {
+        // Formato exato que o OctoPrint espera para comandos GCODE
         string jsonPayload = $"{{\"command\": \"{command}\"}}";
 
         using (UnityWebRequest request = new UnityWebRequest(ApiCommandUrl, "POST"))
         {
-            byte[] bodyRaw = System.Text.Encoding.UTF8.GetBytes(jsonPayload);
+            byte[] bodyRaw = Encoding.UTF8.GetBytes(jsonPayload);
             request.uploadHandler = new UploadHandlerRaw(bodyRaw);
             request.downloadHandler = new DownloadHandlerBuffer();
             request.SetRequestHeader("Content-Type", "application/json");
@@ -115,9 +111,8 @@ public class OctoPrintAPI : MonoBehaviour
 
             if (request.result != UnityWebRequest.Result.Success)
             {
-                Debug.LogError($"Falha ao enviar comando '{command}'. Erro: {request.error}");
+                Debug.LogWarning($"Comando {command} falhou: {request.error}");
             }
-            // Não precisa de um log de sucesso aqui para não poluir o console
         }
     }
 }
